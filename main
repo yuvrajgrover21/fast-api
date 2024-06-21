@@ -1,0 +1,93 @@
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from pydantic import BaseModel
+from transformers import WhisperProcessor, WhisperForConditionalGeneration, pipeline
+from pydub import AudioSegment
+import io
+import os
+import torch
+from datetime import datetime
+
+app = FastAPI()  # This should be at the module level
+
+# Load the whisper-large-v3 model and processor
+try:
+    model_name = "openai/whisper-large-v3"
+    processor = WhisperProcessor.from_pretrained(model_name)
+    model = WhisperForConditionalGeneration.from_pretrained(model_name)
+    model.eval()
+except Exception as e:
+    print(f"Error loading Whisper model: {e}")
+
+# Load the summarization model
+try:
+    summarizer = pipeline("summarization")
+except Exception as e:
+    print(f"Error loading summarization model: {e}")
+
+# Define paths for saving files
+BASE_DIR = "./transcriptions"
+os.makedirs(BASE_DIR, exist_ok=True)
+
+class TranscriptionResponse(BaseModel):
+    transcription: str
+
+class SummaryResponse(BaseModel):
+    summary: str
+
+@app.post("/transcribe/", response_model=TranscriptionResponse)
+async def transcribe_audio(file: UploadFile = File(...)):
+    try:
+        # Read the uploaded file
+        audio_data = await file.read()
+
+        # Load audio file with pydub
+        audio = AudioSegment.from_file(io.BytesIO(audio_data))
+
+        # Convert audio to mono and the desired sample rate (16000 Hz)
+        audio = audio.set_channels(1).set_frame_rate(16000)
+
+        # Export the audio to raw bytes
+        audio_bytes = audio.export(format="wav").read()
+
+        # Prepare the audio inputs for the model
+        inputs = processor(audio_bytes, sampling_rate=16000, return_tensors="pt")
+
+        # Perform inference
+        with torch.no_grad():
+            generated_ids = model.generate(inputs["input_features"])
+
+        # Decode the transcription
+        transcription = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+
+        # Save the transcription to a file
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        transcription_file = os.path.join(BASE_DIR, f"transcription_{timestamp}.txt")
+        with open(transcription_file, "w") as f:
+            f.write(transcription)
+
+        return {"transcription": transcription}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing audio file: {e}")
+
+@app.post("/summarize/", response_model=SummaryResponse)
+async def summarize_text(transcription: TranscriptionResponse):
+    try:
+        summary = summarizer(transcription.transcription, max_length=150, min_length=50, do_sample=False)[0]["summary_text"]
+
+        # Save the summary to a file
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        summary_file = os.path.join(BASE_DIR, f"summary_{timestamp}.txt")
+        with open(summary_file, "w") as f:
+            f.write(summary)
+
+        return {"summary": summary}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating summary: {e}")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+@app.get("/")
+async def read_root():
+    return {"message": "Hello World"}
